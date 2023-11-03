@@ -3,6 +3,7 @@ package numa
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,15 +12,19 @@ import (
 
 // Node represent NUMA node ID, CPU IDs and memory information.
 type Node struct {
-	ID       int
-	CPU      []int
-	MemTotal uint64
-	MemFree  uint64
+	ID           int
+	CPU          []int
+	MemAvailable uint64
+	MemFree      uint64
+	MemTotal     uint64
 }
 
 type memInfo struct {
-	MemTotal uint64
-	MemFree  uint64
+	MemTotal     uint64
+	MemFree      uint64
+	ActiveFile   uint64
+	InactiveFile uint64
+	SReclaimable uint64
 }
 
 // GetNodes returns NUMA nodes information.
@@ -57,10 +62,11 @@ func GetNodes() ([]Node, error) {
 		}
 
 		nodes = append(nodes, Node{
-			ID:       nodeID,
-			CPU:      cpuIDs,
-			MemTotal: meminfo.MemTotal,
-			MemFree:  meminfo.MemFree,
+			ID:           nodeID,
+			CPU:          cpuIDs,
+			MemAvailable: calculateAvailableMemory(meminfo),
+			MemFree:      meminfo.MemFree,
+			MemTotal:     meminfo.MemTotal,
 		})
 	}
 
@@ -102,6 +108,27 @@ func parseMemInfo(path string) (memInfo, error) {
 				return memInfo{}, err
 			}
 			m.MemFree = t * 1024
+		case "Active(file)":
+			t, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return memInfo{}, err
+			}
+
+			m.ActiveFile = t * 1024
+		case "Inactive(file)":
+			t, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return memInfo{}, err
+			}
+
+			m.InactiveFile = t * 1024
+		case "SReclaimable":
+			t, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return memInfo{}, err
+			}
+
+			m.SReclaimable = t * 1024
 		}
 	}
 
@@ -136,4 +163,48 @@ func parseCpuList(path string) ([]int, error) {
 	}
 
 	return ids, nil
+}
+
+func calculateAvailableMemory(m memInfo) uint64 {
+	watermarkLow, err := getWatermarkLow()
+	if err != nil {
+		return m.MemFree + m.SReclaimable + m.ActiveFile + m.InactiveFile
+	}
+
+	memAvailable := m.MemFree - watermarkLow
+	pageCache := m.ActiveFile + m.InactiveFile
+	pageCache -= uint64(math.Min(float64(pageCache/2), float64(watermarkLow)))
+	memAvailable += pageCache
+	memAvailable += m.SReclaimable - uint64(math.Min(float64(m.SReclaimable/2.0), float64(watermarkLow)))
+
+	if memAvailable < 0 {
+		memAvailable = 0
+	}
+
+	return memAvailable
+}
+
+func getWatermarkLow() (uint64, error) {
+	var watermarkLow uint64
+	watermarkLow = 0
+
+	f, err := os.Open("/proc/zoneinfo")
+	if err != nil {
+		return watermarkLow, err
+	}
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+
+		if strings.HasPrefix(fields[0], "low") {
+			lowValue, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				lowValue = 0
+			}
+			watermarkLow += lowValue
+		}
+	}
+
+	return watermarkLow * uint64(os.Getpagesize()), nil
 }
